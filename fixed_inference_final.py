@@ -1,4 +1,5 @@
 import modal
+import json
 
 app = modal.App("viral-post-inference-fixed")
 
@@ -20,34 +21,38 @@ checkpoint_vol = modal.Volume.from_name("viral-checkpoints", create_if_missing=F
     volumes={"/checkpoints": checkpoint_vol},
     scaledown_window=300,
 )
-def generate_post(platform="twitter", hook_type="question", psychology="urgency",
-                  cta_type="explicit", pillar="education"):
+def generate_post(platform: str = "twitter", hook_type: str = "question",
+                  psychology: str = '["urgency"]',  # Pass as JSON string
+                  cta_type: str = "explicit", pillar: str = "education"):
     """Generate a viral post"""
     from unsloth import FastLanguageModel
-    from peft import PeftModel
     import torch
     
-    print("🔄 Loading model...")
+    print("🔄 Loading model from checkpoint...")
     
-    # Load base model
-    base_model = "unsloth/mistral-7b-v0.3-bnb-4bit"
+    # Load Unsloth model directly from the fine-tuned checkpoint
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=base_model,
+        model_name="/checkpoints/final",
         max_seq_length=512,
         dtype=None,
         load_in_4bit=True,
     )
     
-    # Load adapter
-    print("📦 Loading fine-tuned adapter...")
-    model = PeftModel.from_pretrained(model, "/checkpoints/final")
-    
-    # Set for inference
+    # Set for inference (Unsloth optimization)
     FastLanguageModel.for_inference(model)
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Ensure psychology is a string that looks like a list, like in training
+    try:
+        # Re-format string to be a valid list representation
+        psychology_list = json.loads(psychology.replace("'", "\""))
+        psychology_formatted = str(psychology_list)
+    except (json.JSONDecodeError, TypeError):
+        # Fallback for single values
+        psychology_formatted = f"['{psychology}']"
+
     # Match the EXACT training format
     prompt = f"""### Instruction:
 Generate a viral social media post with these characteristics.
@@ -55,7 +60,7 @@ Generate a viral social media post with these characteristics.
 ### Input:
 Platform: {platform}
 Hook type: {hook_type}
-Psychology: ['{psychology}']
+Psychology: {psychology_formatted}
 CTA: {cta_type}
 Pillar: {pillar}
 
@@ -69,10 +74,10 @@ Pillar: {pillar}
         outputs = model.generate(
             **inputs,
             max_new_tokens=150,
-            temperature=0.8,
+            temperature=0.7,
             do_sample=True,
             top_p=0.9,
-            repetition_penalty=1.3,
+            repetition_penalty=1.1,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -89,21 +94,35 @@ Pillar: {pillar}
     if "### Output:" in generated:
         result = generated.split("### Output:")[-1].strip()
     else:
-        result = generated
-    
-    # Remove any trailing special tokens
+        # Fallback if the model doesn't follow the format
+        result = generated.split("### Input:")[-1].strip()
+        if f"Pillar: {pillar}" in result:
+             result = result.split(f"Pillar: {pillar}")[-1].strip()
+
     if "<|endoftext|>" in result:
         result = result.split("<|endoftext|>")[0].strip()
     
     return result
 
 @app.local_entrypoint()
-def main(platform: str = "twitter"):
+def main(
+    platform: str = "twitter",
+    hook_type: str = "statement",
+    psychology: str = '["surprise", "FOMO"]',
+    cta_type: str = "none",
+    pillar: str = "education",
+):
     print(f"\n{'='*60}")
     print(f"GENERATING {platform.upper()} POST")
     print(f"{'='*60}\n")
     
-    post = generate_post.remote(platform=platform)
+    post = generate_post.remote(
+        platform=platform,
+        hook_type=hook_type,
+        psychology=psychology,
+        cta_type=cta_type,
+        pillar=pillar,
+    )
     
     print(f"\n{'='*60}")
     print("FINAL RESULT:")

@@ -123,7 +123,7 @@ def finetune(config: TrainingConfig):
     def format_example(ex):
         # Add EOS token to help model learn when to stop
         return {
-            "text": f"### Instruction:\n{ex['instruction']}\n\n### Input:\n{ex['input']}\n\n### Output:\n{ex['output']}<|endoftext|>"
+            "text": f"### Instruction:\n{ex['instruction']}\n\n### Input:\n{ex['input']}\n\n### Output:\n{ex['output']}{tokenizer.eos_token}"
         }
     
     dataset = datasets.Dataset.from_list([format_example(ex) for ex in data])
