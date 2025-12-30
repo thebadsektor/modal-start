@@ -1,0 +1,224 @@
+import modal
+from dataclasses import dataclass
+
+app = modal.App("viral-post-inference")
+
+# 🔹 Same dependencies & Unsloth setup as training
+inference_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .uv_pip_install(
+        "unsloth[cu128-torch270]==2025.7.8",
+        "transformers==4.54.0",
+        "peft==0.16.0",
+        "accelerate==1.9.0",
+    )
+)
+
+# 🔹 Reuse checkpoint volume from training
+checkpoint_vol = modal.Volume.from_name("viral-checkpoints", create_if_missing=False)
+
+
+@dataclass
+class PostRequest:
+    platform: str = "twitter"
+    hook_type: str = "question"
+    psychology: str = "urgency"
+    cta_type: str = "explicit"
+    pillar: str = "education"
+
+
+@app.cls(
+    image=inference_image,
+    gpu="T4",
+    volumes={"/checkpoints": checkpoint_vol},
+    scaledown_window=300,
+)
+class ViralPostGenerator:
+
+    @modal.enter()
+    def load_model(self):
+        """Load the fine-tuned model once per container."""
+        from unsloth import FastLanguageModel
+        from peft import PeftModel
+        from transformers import AutoTokenizer
+        import os
+
+        print("🔄 Loading Unsloth model for inference...")
+
+        model_name = "unsloth/mistral-7b-v0.3-bnb-4bit"
+        adapter_path = "/checkpoints/final"
+
+        # === 1. Load base Unsloth model (same as training) ===
+        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=512,
+            dtype=None,
+            load_in_4bit=True,
+            trust_remote_code=True,
+        )
+
+        # === 2. Reload tokenizer explicitly to ensure vocab match ===
+        # Sometimes Unsloth's quantized models need tokenizer reload.
+        print("🔧 Reinitializing tokenizer for full alignment...")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=False,
+            trust_remote_code=True,
+        )
+
+        # === 3. Load LoRA adapter ===
+        if os.path.exists(os.path.join(adapter_path, "adapter_config.json")):
+            print("📦 Loading LoRA adapter weights...")
+            self.model = PeftModel.from_pretrained(self.model, adapter_path)
+        else:
+            print("⚠️ No adapter_config.json found — using merged model checkpoint only.")
+
+        # === 4. Sanity checks ===
+        print("🔍 Checking LoRA layers:")
+        for name, module in self.model.named_modules():
+            if "lora" in name.lower():
+                print("✅", name)
+                break
+        else:
+            print("⚠️ No LoRA adapters found — model may be base or merged.")
+
+        # === 5. Fix special tokens ===
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
+
+        print("✅ Model and tokenizer loaded successfully!")
+
+
+    @modal.method()
+    def generate(self, request: PostRequest) -> str:
+        """Generate a viral post based on request parameters."""
+        import torch
+
+        # Match dataset prompt structure exactly
+        prompt = (
+            "### Instruction:\n"
+            "Generate a viral social media post with these characteristics.\n\n"
+            "### Input:\n"
+            f"Platform: {request.platform}\n"
+            f"Hook type: {request.hook_type}\n"
+            f"Psychology: ['{request.psychology}']\n"
+            f"CTA: {request.cta_type}\n"
+            f"Pillar: {request.pillar}\n\n"
+            "### Output:\n"
+        )
+
+        print("🔎 Sample tokenization of prompt:")
+        print(self.tokenizer.tokenize("### Instruction: Generate a viral post")[:10])
+        
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=150,
+                temperature=0.8,
+                top_p=0.95,
+                do_sample=True,
+                repetition_penalty=1.3,     # stronger penalty
+                no_repeat_ngram_size=3,     # prevents "the the the"
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        if "### Output:" in generated_text:
+            result = generated_text.split("### Output:")[-1].strip()
+        else:
+            result = generated_text.strip()
+
+        if "<|endoftext|>" in result:
+            result = result.split("<|endoftext|>")[0].strip()
+
+        return result
+
+    @modal.method()
+    def generate_batch(self, requests: list[PostRequest]) -> list[str]:
+        """Generate multiple posts at once."""
+        return [self.generate(req) for req in requests]
+
+
+@app.local_entrypoint()
+def main(
+    platform: str = "twitter",
+    hook_type: str = "question",
+    psychology: str = "urgency",
+    cta_type: str = "explicit",
+    pillar: str = "education",
+    batch: bool = False,
+):
+    """Run generation locally (triggers Modal cloud inference)."""
+
+    if not batch:
+        print(f"\n{'='*60}")
+        print("VIRAL POST GENERATOR")
+        print(f"{'='*60}")
+        print(f"Platform: {platform}")
+        print(f"Hook: {hook_type} | Psychology: {psychology}")
+        print(f"CTA: {cta_type} | Pillar: {pillar}")
+        print(f"{'='*60}\n")
+
+        request = PostRequest(
+            platform=platform,
+            hook_type=hook_type,
+            psychology=psychology,
+            cta_type=cta_type,
+            pillar=pillar,
+        )
+
+        print("🚀 Generating on Modal GPU...\n")
+        generator = ViralPostGenerator()
+        post = generator.generate.remote(request)
+
+        print(f"{'='*60}")
+        print("GENERATED POST:")
+        print(f"{'='*60}")
+        print(post)
+        print(f"{'='*60}\n")
+
+    else:
+        print(f"\n{'='*60}")
+        print("BATCH VIRAL POST GENERATION")
+        print(f"{'='*60}\n")
+
+        examples = [
+            PostRequest(
+                platform="twitter",
+                hook_type="question",
+                psychology="urgency",
+                cta_type="explicit",
+                pillar="education",
+            ),
+            PostRequest(
+                platform="linkedin",
+                hook_type="story",
+                psychology="inspiration",
+                cta_type="implicit",
+                pillar="education",
+            ),
+            PostRequest(
+                platform="instagram",
+                hook_type="curiosity_gap",
+                psychology="FOMO",
+                cta_type="explicit",
+                pillar="entertainment",
+            ),
+        ]
+
+        print("🚀 Generating 3 posts on Modal GPU...\n")
+        generator = ViralPostGenerator()
+        posts = generator.generate_batch.remote(examples)
+
+        for i, (req, post) in enumerate(zip(examples, posts), 1):
+            print(f"{'='*60}")
+            print(f"POST {i}: {req.platform.upper()}")
+            print(f"Hook: {req.hook_type} | Psychology: {req.psychology}")
+            print(f"{'='*60}")
+            print(post)
+            print(f"{'='*60}\n")
