@@ -82,7 +82,7 @@ Pillar: {pillar}
             eos_token_id=tokenizer.eos_token_id,
         )
     
-    generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    generated = tokenizer.decode(outputs[0], skip_special_tokens=False)
     
     print("\n" + "="*60)
     print("RAW OUTPUT (for debugging):")
@@ -99,8 +99,8 @@ Pillar: {pillar}
         if f"Pillar: {pillar}" in result:
              result = result.split(f"Pillar: {pillar}")[-1].strip()
 
-    if "<|endoftext|>" in result:
-        result = result.split("<|endoftext|>")[0].strip()
+    if tokenizer.eos_token in result:
+        result = result.split(tokenizer.eos_token)[0].strip()
     
     return result
 
