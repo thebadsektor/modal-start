@@ -70,13 +70,7 @@ for i, example in enumerate(original_data[:sample_size]):
     
     original_post = example['output']
     
-    # Add original (with cleaned input - no reference)
     clean_input = '\n'.join(input_lines[:5])  # Just the characteristics
-    augmented_data.append({
-        "instruction": "Generate a viral social media post with these characteristics.",
-        "input": clean_input,
-        "output": original_post
-    })
     
     # Generate 2 variations
     for v in range(2):
